@@ -4250,10 +4250,10 @@ CL_API_ENTRY void CL_API_CALL clSVMFree(
         khrFirstLayer->dispatch.clSVMFree(
             context,
             svm_pointer);
+        return;
     }
-    else
 #endif // defined(CL_ENABLE_LAYERS)
-    if (context != NULL)
+    if (context == NULL) return;
     context->dispatch->clSVMFree(
         context,
         svm_pointer);
