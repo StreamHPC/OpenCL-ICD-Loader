@@ -82,13 +82,10 @@ if (WIN32)
         loader/windows/adapter.h
         loader/windows/icd_windows.c
         loader/windows/icd_windows.h
-        loader/windows/icd_windows_dxgk.c
-        loader/windows/icd_windows_dxgk.h
+        loader/windows/icd_windows_hkr.h        # header-only for linking reasons
+        loader/windows/icd_windows_dxgk.h       # header-only for linking reasons
+        loader/windows/icd_windows_apppackage.h # header-only for linking reasons
         loader/windows/icd_windows_envvars.c
-        loader/windows/icd_windows_hkr.c
-        loader/windows/icd_windows_hkr.h
-        loader/windows/icd_windows_apppackage.c
-        loader/windows/icd_windows_apppackage.h
         loader/windows/OpenCL.rc)
     # Only add the DXSDK include directory if the environment variable is
     # defined.  Since the DXSDK has merged into the Windows SDK, this is
