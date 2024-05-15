@@ -3,14 +3,16 @@ name: Linux
 on: [push, pull_request]
 
 env:
-  OPENCL_PKGCONFIG_PATHS: ${{ github.workspace }}/install/lib/pkgconfig:${{ github.workspace }}/external/OpenCL-Headers/install/share/pkgconfig
+  DEB_INSTALLATION_PATH: /usr
+  INSTALL_LIBDIR: lib/x86_64-linux-gnu
+  OPENCL_PKGCONFIG_PATHS: $DEB_INSTALLATION_PATH/INSTALL_LIBDIR/pkgconfig:${{ github.workspace }}/install/$INSTALL_LIBDIR/pkgconfig:${{ github.workspace }}/external/OpenCL-Headers/install/share/pkgconfig
 
 jobs:
-
   tools:
-    runs-on: ubuntu-20.04
+    runs-on: ${{ matrix.OS }}
     strategy:
       matrix:
+        OS : [ubuntu-20.04]
         CMAKE: [3.21.2]
     env:
       CMAKE_URL: https://github.com/Kitware/CMake/releases/download/v${{ matrix.CMAKE }}/cmake-${{ matrix.CMAKE }}-Linux-x86_64.tar.gz
@@ -39,12 +41,13 @@ jobs:
         GEN: [Unix Makefiles]
         CONFIG: [Debug, Release]
         STD: [99, 11]
-        BIN: [32, 64]
-        CMAKE: [3.1.3] #3.21.2
+        BIN: [64] # Temporarily disable cross-compilation
+        CMAKE: [3.1.3]
     env:
       CMAKE_EXE: /opt/Kitware/CMake/${{ matrix.CMAKE }}/bin/cmake
+      CPACK_EXE: /opt/Kitware/CMake/${{ matrix.CMAKE }}/bin/cpack
       CTEST_EXE: /opt/Kitware/CMake/${{ matrix.CMAKE }}/bin/ctest
-      OPENCL_PKGCONFIG_PATHS: /__w/OpenCL-ICD-Loader/OpenCL-ICD-Loader/install/lib/pkgconfig:/__w/OpenCL-ICD-Loader/OpenCL-ICD-Loader/external/OpenCL-Headers/install/share/pkgconfig
+      OPENCL_PKGCONFIG_PATHS: $DEB_INSTALLATION_PATH/$INSTALL_LIBDIR/pkgconfig:/__w/OpenCL-ICD-Loader/OpenCL-ICD-Loader/install/$INSTALL_LIBDIR/pkgconfig:/__w/OpenCL-ICD-Loader/OpenCL-ICD-Loader/external/OpenCL-Headers/install/share/pkgconfig
 
 
     steps:
@@ -54,11 +57,16 @@ jobs:
     - name: Checkout OpenCL-Headers
       uses: actions/checkout@v3
       with:
-        repository: KhronosGroup/OpenCL-Headers
+        # Change to KhronosGroup/OpenCL-Headers when PR for DEB packaging is merged
+        repository: StreamHPC/OpenCL-Headers
         path: external/OpenCL-Headers
+        # Remove when PR for DEB packaging is merged
+        ref: 58-create-deb-package
 
-    - name: Build & install OpenCL-Headers
-      run: $CMAKE_EXE
+    - name: Build install & package OpenCL-Headers
+      run: mkdir $GITHUB_WORKSPACE/external/OpenCL-Headers/build &&
+        cd $GITHUB_WORKSPACE/external/OpenCL-Headers/build &&
+        $CMAKE_EXE
         -G "${{matrix.GEN}}"
         -D CMAKE_BUILD_TYPE=${{matrix.CONFIG}}
         -D CMAKE_C_FLAGS="-w -m${{matrix.BIN}}"
@@ -66,29 +74,36 @@ jobs:
         -D CMAKE_C_STANDARD=${{matrix.STD}}
         -D CMAKE_C_EXTENSIONS=${{matrix.EXT}}
         -D CMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/external/OpenCL-Headers/install
+        -D CPACK_PACKAGING_INSTALL_PREFIX=$DEB_INSTALLATION_PATH
         -D BUILD_TESTING=OFF
-        -B$GITHUB_WORKSPACE/external/OpenCL-Headers/build
-        -H$GITHUB_WORKSPACE/external/OpenCL-Headers &&
+        $GITHUB_WORKSPACE/external/OpenCL-Headers &&
         $CMAKE_EXE
         --build $GITHUB_WORKSPACE/external/OpenCL-Headers/build
         --target install
         --
-        -j`nproc`
+        -j`nproc` &&
+        $CPACK_EXE
+        --config "$GITHUB_WORKSPACE/external/OpenCL-Headers/build/CPackConfig.cmake"
+        -G DEB
+        -C Release
+        -B "$GITHUB_WORKSPACE/external/OpenCL-Headers/package-deb"
 
     - name: Configure
       shell: bash
-      run: $CMAKE_EXE
+      run: mkdir $GITHUB_WORKSPACE/build && cd $GITHUB_WORKSPACE/build &&
+        $CMAKE_EXE
         -G "${{matrix.GEN}}"
         -D BUILD_TESTING=ON
+        -D BUILD_EXAMPLES=ON
         -D CMAKE_BUILD_TYPE=${{matrix.CONFIG}}
         -D CMAKE_C_FLAGS="-Wall -Wextra -Werror -pedantic -m${{matrix.BIN}}"
         -D CMAKE_C_COMPILER=${{matrix.COMPILER}}
         -D CMAKE_C_STANDARD=${{matrix.STD}}
         -D CMAKE_C_EXTENSIONS=${{matrix.EXT}}
         -D CMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/install
-        -D CMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/external/OpenCL-Headers/install
-        -B$GITHUB_WORKSPACE/build
-        -H$GITHUB_WORKSPACE
+        -D CMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/external/OpenCL-Headers/install"
+        -D CPACK_PACKAGING_INSTALL_PREFIX=$DEB_INSTALLATION_PATH
+        $GITHUB_WORKSPACE
 
     - name: Build
       shell: bash
@@ -102,6 +117,14 @@ jobs:
       shell: bash
       run: $CTEST_EXE --output-on-failure --parallel `nproc`
 
+    - name: Package DEB
+      shell: bash
+      run: $CPACK_EXE
+        --config "$GITHUB_WORKSPACE/build/CPackConfig.cmake"
+        -G DEB
+        -C Release
+        -B "$GITHUB_WORKSPACE/package-deb"
+
     - name: Install
       shell: bash
       run: $CMAKE_EXE
@@ -110,68 +133,82 @@ jobs:
         --
         -j`nproc`
 
+    - name: Consume (Package DEB)
+      shell: bash
+      run: dpkg -i $GITHUB_WORKSPACE/external/OpenCL-Headers/package-deb/*.deb &&
+        dpkg -i $GITHUB_WORKSPACE/package-deb/*.deb &&
+        mkdir $GITHUB_WORKSPACE/test/pkgconfig/bare/build &&
+        cd $GITHUB_WORKSPACE/test/pkgconfig/bare/build &&
+        $CMAKE_EXE
+        -G "${{matrix.GEN}}"
+        -D CMAKE_BUILD_TYPE="${{matrix.CONFIG}}"
+        -D CMAKE_C_FLAGS="-Wall -Wextra -pedantic -Werror -m${{matrix.BIN}}"
+        $GITHUB_WORKSPACE/test/pkgconfig/bare &&
+        $CMAKE_EXE --build $GITHUB_WORKSPACE/test/pkgconfig/bare/build -- -j`nproc`
+
     - name: "Consume (standalone): Configure/Build/Test"
       shell: bash
-      run: $CMAKE_EXE
+      run: mkdir -p $GITHUB_WORKSPACE/build/downstream/bare &&
+        cd $GITHUB_WORKSPACE/build/downstream/bare &&
+        $CMAKE_EXE
         -G "${{matrix.GEN}}"
+        -D BUILD_TESTING=ON
         -D CMAKE_BUILD_TYPE=${{matrix.CONFIG}}
-        -D CMAKE_C_COMPILER=${{matrix.COMPILER}}
         -D CMAKE_C_FLAGS="-Wall -Wextra -pedantic -m${{matrix.BIN}}"
+        -D CMAKE_C_COMPILER=${{matrix.COMPILER}}
         -D CMAKE_C_STANDARD=${{matrix.STD}}
         -D CMAKE_C_EXTENSIONS=${{matrix.EXT}}
-        -D CMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/external/OpenCL-Headers/install;$GITHUB_WORKSPACE/install"
         -D DRIVER_STUB_PATH=$GITHUB_WORKSPACE/build/libOpenCLDriverStub.so
-        -B$GITHUB_WORKSPACE/build/downstream/bare
-        -H$GITHUB_WORKSPACE/test/pkgconfig/bare ;
+        $GITHUB_WORKSPACE/test/pkgconfig/bare &&
         $CMAKE_EXE
-        --build $GITHUB_WORKSPACE/build/downstream/bare ;
-        cd $GITHUB_WORKSPACE/build/downstream/bare ;
+        --build $GITHUB_WORKSPACE/build/downstream/bare &&
+        cd $GITHUB_WORKSPACE/build/downstream/bare &&
         $CTEST_EXE --output-on-failure
 
     - name: "Consume (SDK): Configure/Build/Test"
       shell: bash
-      run: $CMAKE_EXE -E make_directory $GITHUB_WORKSPACE/install/share/cmake/OpenCL ;
-        echo -e "include(\"$GITHUB_WORKSPACE/external/OpenCL-Headers/install/share/cmake/OpenCLHeaders/OpenCLHeadersTargets.cmake\")\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/../OpenCLICDLoader/OpenCLICDLoaderTargets.cmake\")" > $GITHUB_WORKSPACE/install/share/cmake/OpenCL/OpenCLConfig.cmake ;
+      run: $CMAKE_EXE -E make_directory $DEB_INSTALLATION_PATH/share/cmake/OpenCL &&
+        echo -e "include(\"$DEB_INSTALLATION_PATH/share/cmake/OpenCLHeaders/OpenCLHeadersTargets.cmake\")\ninclude(\"$DEB_INSTALLATION_PATH/share/cmake/OpenCLICDLoader/OpenCLICDLoaderTargets.cmake\")" > $DEB_INSTALLATION_PATH/share/cmake/OpenCL/OpenCLConfig.cmake &&
+        mkdir -p $GITHUB_WORKSPACE/build/downstream/sdk &&
+        cd $GITHUB_WORKSPACE/build/downstream/sdk &&
         $CMAKE_EXE
         -G "${{matrix.GEN}}"
+        -D BUILD_TESTING=ON
         -D CMAKE_BUILD_TYPE=${{matrix.CONFIG}}
-        -D CMAKE_C_COMPILER=${{matrix.COMPILER}}
         -D CMAKE_C_FLAGS="-Wall -Wextra -pedantic -m${{matrix.BIN}}"
+        -D CMAKE_C_COMPILER=${{matrix.COMPILER}}
         -D CMAKE_C_STANDARD=${{matrix.STD}}
         -D CMAKE_C_EXTENSIONS=${{matrix.EXT}}
-        -D CMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/external/OpenCL-Headers/install;$GITHUB_WORKSPACE/install"
         -D DRIVER_STUB_PATH=$GITHUB_WORKSPACE/build/libOpenCLDriverStub.so
-        -B$GITHUB_WORKSPACE/build/downstream/sdk
-        -H$GITHUB_WORKSPACE/test/pkgconfig/sdk ;
+        $GITHUB_WORKSPACE/test/pkgconfig/sdk &&
         $CMAKE_EXE
-        --build $GITHUB_WORKSPACE/build/downstream/sdk ;
-        cd $GITHUB_WORKSPACE/build/downstream/sdk ;
+        --build $GITHUB_WORKSPACE/build/downstream/sdk &&
+        cd $GITHUB_WORKSPACE/build/downstream/sdk &&
         $CTEST_EXE --output-on-failure
 
     - name: Test pkg-config --cflags
       shell: bash
-      run: PKG_CONFIG_PATH="$OPENCL_PKGCONFIG_PATHS" pkg-config OpenCL --cflags | grep -q "\-I$GITHUB_WORKSPACE/external/OpenCL-Headers/install/include"
+      run: PKG_CONFIG_PATH="$OPENCL_PKGCONFIG_PATHS" pkg-config OpenCL --cflags | grep -q "$GITHUB_WORKSPACE/external/OpenCL-Headers/install/include"
 
     - name: Test pkg-config --libs
       shell: bash
-      run: PKG_CONFIG_PATH="$OPENCL_PKGCONFIG_PATHS" pkg-config OpenCL --libs | grep -q "\-L$GITHUB_WORKSPACE/install/lib -lOpenCL"
+      run: PKG_CONFIG_PATH="$OPENCL_PKGCONFIG_PATHS" pkg-config OpenCL --libs | grep -q "\-L$GITHUB_WORKSPACE/install/$INSTALL_LIBDIR -lOpenCL"
 
     - name: Consume pkg-config
       shell: bash
-      run: PKG_CONFIG_PATH="$OPENCL_PKGCONFIG_PATHS" $CMAKE_EXE
+      run: mkdir -p $GITHUB_WORKSPACE/build/downstream/pkgconfig &&
+        cd $GITHUB_WORKSPACE/build/downstream/pkgconfig &&
+        PKG_CONFIG_PATH="$OPENCL_PKGCONFIG_PATHS" $CMAKE_EXE
         -G "${{matrix.GEN}}"
         -D CMAKE_C_COMPILER=${{matrix.COMPILER}}
         -D CMAKE_C_FLAGS="-Wall -Wextra -pedantic -m${{matrix.BIN}}"
         -D CMAKE_C_STANDARD=${{matrix.STD}}
         -D CMAKE_C_EXTENSIONS=${{matrix.EXT}}
         -D DRIVER_STUB_PATH=$GITHUB_WORKSPACE/build/libOpenCLDriverStub.so
-        -B$GITHUB_WORKSPACE/build/downstream/pkgconfig
-        -H$GITHUB_WORKSPACE/test/pkgconfig/pkgconfig ;
-        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/pkgconfig ;
-        cd $GITHUB_WORKSPACE/build/downstream/pkgconfig ;
+        $GITHUB_WORKSPACE/test/pkgconfig/pkgconfig &&
+        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/pkgconfig &&
+        cd $GITHUB_WORKSPACE/build/downstream/pkgconfig &&
         $CTEST_EXE --output-on-failure
-
-
 
 
 
@@ -185,10 +222,11 @@ jobs:
         EXT: [ON, OFF]
         GEN: [Ninja Multi-Config]
         STD: [99, 11, 17]
-        BIN: [32, 64]
+        BIN: [64] # Temporarily disable cross-compilation
         CMAKE: [3.21.2]
     env:
       CMAKE_EXE: /opt/Kitware/CMake/${{ matrix.CMAKE }}/bin/cmake
+      CPACK_EXE: /opt/Kitware/CMake/${{ matrix.CMAKE }}/bin/cpack
       CTEST_EXE: /opt/Kitware/CMake/${{ matrix.CMAKE }}/bin/ctest
 
 
@@ -199,8 +237,11 @@ jobs:
     - name: Checkout OpenCL-Headers
       uses: actions/checkout@v3
       with:
-        repository: KhronosGroup/OpenCL-Headers
+        # Change to KhronosGroup/OpenCL-Headers when PR for DEB packaging is merged
+        repository: StreamHPC/OpenCL-Headers
         path: external/OpenCL-Headers
+        # Remove when PR for DEB packaging is merged
+        ref: 58-create-deb-package
 
     - name: Restore CMake
       uses: actions/cache@v3
@@ -224,7 +265,7 @@ jobs:
         mv /opt/Kitware/CMake/cmake-${{ matrix.CMAKE }}-* /opt/Kitware/CMake/${{ matrix.CMAKE }}
       # Install Ninja only if it's the selected generator and it's not available.
 
-    - name: Build & install OpenCL-Headers
+    - name: Build, install & package OpenCL-Headers
       run: $CMAKE_EXE
         -G "${{matrix.GEN}}"
         -D CMAKE_C_FLAGS="-w -m${{matrix.BIN}}"
@@ -232,15 +273,20 @@ jobs:
         -D CMAKE_C_STANDARD=${{matrix.STD}}
         -D CMAKE_C_EXTENSIONS=${{matrix.EXT}}
         -D CMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/external/OpenCL-Headers/install
+        -D CPACK_PACKAGING_INSTALL_PREFIX=$DEB_INSTALLATION_PATH
         -D BUILD_TESTING=OFF
         -B $GITHUB_WORKSPACE/external/OpenCL-Headers/build
-        -S $GITHUB_WORKSPACE/external/OpenCL-Headers;
-        $CMAKE_EXE
+        -S $GITHUB_WORKSPACE/external/OpenCL-Headers &&
+        sudo $CMAKE_EXE
         --build $GITHUB_WORKSPACE/external/OpenCL-Headers/build
         --target install
-        --config Release
         --
-        -j`nproc`
+        -j`nproc` &&
+        sudo $CPACK_EXE
+        --config "$GITHUB_WORKSPACE/external/OpenCL-Headers/build/CPackConfig.cmake"
+        -G DEB
+        -C Release
+        -B "$GITHUB_WORKSPACE/external/OpenCL-Headers/package-deb"
 
     - name: Configure
       shell: bash
@@ -252,22 +298,31 @@ jobs:
         -D CMAKE_C_STANDARD=${{matrix.STD}}
         -D CMAKE_C_EXTENSIONS=${{matrix.EXT}}
         -D CMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/install
-        -D CMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/external/OpenCL-Headers/install
+        -D CMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/external/OpenCL-Headers/install"
+        -D CPACK_PACKAGING_INSTALL_PREFIX=$DEB_INSTALLATION_PATH
         -B $GITHUB_WORKSPACE/build
         -S $GITHUB_WORKSPACE
 
     - name: Build
       shell: bash
       run: |
-        $CMAKE_EXE --build $GITHUB_WORKSPACE/build --config Release -- -j`nproc`;
+        $CMAKE_EXE --build $GITHUB_WORKSPACE/build --config Release -- -j`nproc` &&
         $CMAKE_EXE --build $GITHUB_WORKSPACE/build --config Debug   -- -j`nproc`
 
     - name: Test
       working-directory: ${{runner.workspace}}/OpenCL-ICD-Loader/build
       shell: bash
       run: |
-        $CTEST_EXE --output-on-failure -C Release --parallel `nproc`;
-        $CTEST_EXE --output-on-failure -C Debug   --parallel `nproc`;
+        $CTEST_EXE --output-on-failure -C Release --parallel `nproc` &&
+        $CTEST_EXE --output-on-failure -C Debug   --parallel `nproc`
+
+    - name: Package DEB
+      shell: bash
+      run: $CPACK_EXE
+        --config "$GITHUB_WORKSPACE/build/CPackConfig.cmake"
+        -G DEB
+        -C Release
+        -B "$GITHUB_WORKSPACE/package-deb"
 
     - name: Install
       shell: bash
@@ -278,51 +333,62 @@ jobs:
         --
         -j`nproc`
 
+    - name: Consume (Package DEB)
+      shell: bash
+      run: sudo dpkg -i $GITHUB_WORKSPACE/external/OpenCL-Headers/package-deb/*.deb &&
+        sudo dpkg -i $GITHUB_WORKSPACE/package-deb/*.deb &&
+        $CMAKE_EXE
+        -G "${{matrix.GEN}}"
+        -D CMAKE_C_FLAGS="-Wall -Wextra -pedantic -m${{matrix.BIN}}"
+        -B $GITHUB_WORKSPACE/test/pkgconfig/bare/build
+        -S $GITHUB_WORKSPACE/test/pkgconfig/bare &&
+        $CMAKE_EXE --build $GITHUB_WORKSPACE/test/pkgconfig/bare/build --config Release &&
+        $CMAKE_EXE --build $GITHUB_WORKSPACE/test/pkgconfig/bare/build --config Debug
+
     - name: "Consume (standalone): Configure/Build/Test"
       shell: bash
       run: $CMAKE_EXE
         -G "${{matrix.GEN}}"
-        -D CMAKE_C_COMPILER=${{matrix.COMPILER}}
         -D CMAKE_C_FLAGS="-Wall -Wextra -pedantic -m${{matrix.BIN}}"
+        -D CMAKE_C_COMPILER=${{matrix.COMPILER}}
         -D CMAKE_C_STANDARD=${{matrix.STD}}
         -D CMAKE_C_EXTENSIONS=${{matrix.EXT}}
-        -D CMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/external/OpenCL-Headers/install;$GITHUB_WORKSPACE/install"
         -D DRIVER_STUB_PATH=$GITHUB_WORKSPACE/build/Release/libOpenCLDriverStub.so
         -B $GITHUB_WORKSPACE/build/downstream/bare
-        -S $GITHUB_WORKSPACE/test/pkgconfig/bare;
-        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/bare --config Release;
-        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/bare --config Debug;
-        cd $GITHUB_WORKSPACE/build/downstream/bare;
-        $CTEST_EXE --output-on-failure -C Release;
-        $CTEST_EXE --output-on-failure -C Debug;
+        -S $GITHUB_WORKSPACE/test/pkgconfig/bare &&
+        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/bare --config Release &&
+        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/bare --config Debug &&
+        cd $GITHUB_WORKSPACE/build/downstream/bare &&
+        $CTEST_EXE --output-on-failure -C Release &&
+        $CTEST_EXE --output-on-failure -C Debug
 
     - name: "Consume (SDK): Configure/Build/Test"
       shell: bash
-      run: $CMAKE_EXE -E make_directory $GITHUB_WORKSPACE/install/share/cmake/OpenCL ;
-        echo -e "include(\"$GITHUB_WORKSPACE/external/OpenCL-Headers/install/share/cmake/OpenCLHeaders/OpenCLHeadersTargets.cmake\")\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/../OpenCLICDLoader/OpenCLICDLoaderTargets.cmake\")" > $GITHUB_WORKSPACE/install/share/cmake/OpenCL/OpenCLConfig.cmake ;
+      run: $CMAKE_EXE -E make_directory $DEB_INSTALLATION_PATH/share/cmake/OpenCL &&
+        echo -e "include(\"$DEB_INSTALLATION_PATH/share/cmake/OpenCLHeaders/OpenCLHeadersTargets.cmake\")\ninclude(\"$DEB_INSTALLATION_PATH/share/cmake/OpenCLICDLoader/OpenCLICDLoaderTargets.cmake\")" > $DEB_INSTALLATION_PATH/share/cmake/OpenCL/OpenCLConfig.cmake &&
         $CMAKE_EXE
         -G "${{matrix.GEN}}"
-        -D CMAKE_C_COMPILER=${{matrix.COMPILER}}
+        -D BUILD_TESTING=ON
         -D CMAKE_C_FLAGS="-Wall -Wextra -pedantic -m${{matrix.BIN}}"
+        -D CMAKE_C_COMPILER=${{matrix.COMPILER}}
         -D CMAKE_C_STANDARD=${{matrix.STD}}
         -D CMAKE_C_EXTENSIONS=${{matrix.EXT}}
-        -D CMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/external/OpenCL-Headers/install;$GITHUB_WORKSPACE/install"
         -D DRIVER_STUB_PATH=$GITHUB_WORKSPACE/build/Release/libOpenCLDriverStub.so
         -B $GITHUB_WORKSPACE/build/downstream/sdk
-        -S $GITHUB_WORKSPACE/test/pkgconfig/sdk;
-        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/sdk --config Release;
-        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/sdk --config Debug;
-        cd $GITHUB_WORKSPACE/build/downstream/sdk;
-        $CTEST_EXE --output-on-failure -C Release;
-        $CTEST_EXE --output-on-failure -C Debug;
+        -S $GITHUB_WORKSPACE/test/pkgconfig/sdk &&
+        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/sdk --config Release &&
+        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/sdk --config Debug &&
+        cd $GITHUB_WORKSPACE/build/downstream/sdk &&
+        $CTEST_EXE --output-on-failure -C Release &&
+        $CTEST_EXE --output-on-failure -C Debug
 
     - name: Test pkg-config --cflags
       shell: bash
-      run: PKG_CONFIG_PATH="$OPENCL_PKGCONFIG_PATHS" pkg-config OpenCL --cflags | grep -q "\-I$GITHUB_WORKSPACE/external/OpenCL-Headers/install/include"
+      run: PKG_CONFIG_PATH="$OPENCL_PKGCONFIG_PATHS" pkg-config OpenCL --cflags | grep -q "$GITHUB_WORKSPACE/external/OpenCL-Headers/install/include"
 
     - name: Test pkg-config --libs
       shell: bash
-      run: PKG_CONFIG_PATH="$OPENCL_PKGCONFIG_PATHS" pkg-config OpenCL --libs | grep -q "\-L$GITHUB_WORKSPACE/install/lib -lOpenCL"
+      run: PKG_CONFIG_PATH="$OPENCL_PKGCONFIG_PATHS" pkg-config OpenCL --libs | grep -q "\-L$GITHUB_WORKSPACE/install/$INSTALL_LIBDIR -lOpenCL"
 
     - name: Consume pkg-config
       shell: bash
@@ -334,9 +400,9 @@ jobs:
         -D CMAKE_C_EXTENSIONS=${{matrix.EXT}}
         -D DRIVER_STUB_PATH=$GITHUB_WORKSPACE/build/Release/libOpenCLDriverStub.so
         -B $GITHUB_WORKSPACE/build/downstream/pkgconfig
-        -S $GITHUB_WORKSPACE/test/pkgconfig/pkgconfig;
-        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/pkgconfig --config Release;
-        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/pkgconfig --config Debug;
-        cd $GITHUB_WORKSPACE/build/downstream/pkgconfig;
-        $CTEST_EXE --output-on-failure -C Release;
-        $CTEST_EXE --output-on-failure -C Debug;
+        -S $GITHUB_WORKSPACE/test/pkgconfig/pkgconfig &&
+        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/pkgconfig --config Release &&
+        $CMAKE_EXE --build $GITHUB_WORKSPACE/build/downstream/pkgconfig --config Debug &&
+        cd $GITHUB_WORKSPACE/build/downstream/pkgconfig &&
+        $CTEST_EXE --output-on-failure -C Release &&
+        $CTEST_EXE --output-on-failure -C Debug
